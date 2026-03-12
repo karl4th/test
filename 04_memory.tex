@@ -1,0 +1,298 @@
+\section{Обзор системы памяти}
+
+DREAM-Net реализует двухмасштабную систему памяти, вдохновлённую гипотезой о разделении памяти в биологических системах (гиппокампально-неокортикальный диалог). Данная архитектура предназначена для решения дилеммы пластичность-стабильность: способности адаптироваться к новым данным без деградации ранее усвоенных знаний.
+
+\textbf{Ключевые компоненты:}
+\begin{enumerate}
+    \item \textbf{Быстрые веса ($U$)} — оперативная память, адаптируемая в реальном времени.
+    \item \textbf{Медленные веса ($W$)} — долговременное хранилище знаний, обновляемое в фазе сна.
+    \item \textbf{Контекстный вектор ($c_t$)} — рабочая память текущей последовательности.
+    \item \textbf{Механизм консолидации} — асинхронный перенос знаний из быстрой памяти в медленную.
+\end{enumerate}
+
+\section{Двухмасштабная система весов (Dual-Timescale Weights)}
+
+\subsection{Быстрые веса (Fast Weights)}
+
+Быстрые веса $U_t^{(l)}$ представляют собой низкоранговую матрицу, которая обновляется на каждом шаге инференса в зависимости от коэффициента удивления $S_t$.
+
+\begin{table}[h]
+\centering
+\caption{Характеристики быстрых весов}
+\label{tab:fast_weights}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Значение} & \textbf{Обоснование} \\
+\midrule
+Размерность & $(d_{state} \times r)$ & $r \ll d_{state}$ для эффективности \\
+Ранг ($r$) & 32 (по умолчанию) & Баланс между ёмкостью и вычислениями \\
+Частота обновления & Каждый шаг $t$ & Мгновенная адаптация \\
+Источник градиента & Surprise Gate ($S_t$) & Избирательная пластичность \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Уравнение обновления:}
+\begin{equation}
+U_{t+1}^{(l)} = U_t^{(l)} + \eta \cdot S_t \cdot \left(h_t^{(l)} \otimes e_t^{(l)}\right) V^{(l)} - \lambda_{decay} \left(U_t^{(l)} - U_{target}^{(l)}\right)
+\label{eq:fast_weights_update}
+\end{equation}
+
+\textbf{Назначение:} Быстрые веса кодируют временные особенности текущего контекста (диктор, акустика, темп), которые могут измениться в любой момент.
+
+\subsection{Медленные веса (Slow Weights)}
+
+Медленные веса $W^{(l)}$ представляют собой полные матрицы размера $(d_{state} \times d_{state})$, которые остаются фиксированными во время инференса.
+
+\begin{table}[h]
+\centering
+\caption{Характеристики медленных весов}
+\label{tab:slow_weights}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Значение} & \textbf{Обоснование} \\
+\midrule
+Размерность & $(d_{state} \times d_{state})$ & Полная ёмкость представления \\
+Частота обновления & Только во время сна & Стабильность долгосрочных знаний \\
+Источник градиента & Backpropagation (оффлайн) & Глобальная оптимизация \\
+Защита & EWC-регуляризация & Предотвращение забывания \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Назначение:} Медленные веса кодируют универсальные закономерности (фонетика, грамматика, общие паттерны), которые должны сохраняться независимо от текущего контекста.
+
+\subsection{Целевые веса (Target Weights)}
+
+Для обеспечения плавной консолидации вводится промежуточное представление $U_{target}^{(l)}$, которое служит «мостом» между быстрыми и медленными весами.
+
+\textbf{Роль $U_{target}$:}
+\begin{itemize}
+    \item Служит аттрактором для быстрых весов $U_t$ (через $\lambda_{decay}$).
+    \item Накопляет усреднённый опыт за сессию работы.
+    \item Используется как источник для обновления медленных весов $W$ во время сна.
+\end{itemize}
+
+\section{Механизм двойной буферизации (Double Buffering)}
+
+Для обеспечения потокобезопасности при асинхронной работе инференса и консолидации вводится схема двойной буферизации весов.
+
+\subsection{Архитектура буферов}
+
+Система использует два независимых буфера весов:
+
+\begin{table}[h]
+\centering
+\caption{Буферы весов и их назначение}
+\label{tab:buffers}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Буфер} & \textbf{Назначение} & \textbf{Доступ} \\
+\midrule
+\textbf{Buffer A (Active)} & Обслуживает инференс & Только чтение для \texttt{step()} \\
+\textbf{Buffer B (Shadow)} & Принимает обновления от \texttt{sleep()} & Только запись для \texttt{sleep()} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Атомарный своп (Atomic Swap)}
+
+По завершении фазы сна происходит атомарное переключение указателей на буферы:
+
+\begin{lstlisting}[language=Python, caption={Атомарный своп буферов}, label={lst:buffer_swap}]
+class MemorySystem:
+    def __init__(self):
+        self.buffer_active = WeightBuffer()   # Buffer A
+        self.buffer_shadow = WeightBuffer()   # Buffer B
+        self.lock = threading.Lock()
+
+    def swap_buffers(self):
+        """Атомарный своп указателей после завершения сна"""
+        with self.lock:
+            self.buffer_active, self.buffer_shadow = \
+                self.buffer_shadow, self.buffer_active
+\end{lstlisting}
+
+\textbf{Гарантии:}
+\begin{itemize}
+    \item Инференс никогда не читает частично обновлённые веса.
+    \item Сон никогда не перезаписывает веса, используемые для инференса.
+    \item Переключение указателей является атомарной операцией (O(1)).
+\end{itemize}
+
+\subsection{Схема работы во времени}
+
+\begin{itemize}
+    \item \textbf{Время:} $t_0 \rightarrow t_1 \rightarrow t_2 \rightarrow t_3$
+    \item \textbf{Инференс:} [Step A] → [Step A] → [Step A] → [Step A]
+    \item \textbf{Сон:} [Sleep B] → [Sleep B]
+    \item \textbf{Своп:} [Swap A↔B] после завершения сна
+\end{itemize}
+
+\textbf{Примечание:} В реализации на Python (с GIL) операция присваивания указателей атомарна. В C++/Rust необходимо использовать \texttt{std::atomic} или эквивалентные механизмы.
+
+\section{Фаза сна и консолидация (Sleep Cycle)}
+
+\subsection{Триггеры запуска сна}
+
+Фаза сна запускается асинхронно при выполнении одного из условий:
+
+\begin{table}[h]
+\centering
+\caption{Триггеры запуска фазы сна}
+\label{tab:sleep_triggers}
+\begin{tabular}{lp{6cm}l}
+\toprule
+\textbf{Триггер} & \textbf{Условие} & \textbf{Приоритет} \\
+\midrule
+\textbf{Таймер} & Прошло $T_{sleep}$ секунд с последнего сна & Низкий \\
+\textbf{Буфер событий} & Накоплено $N_{events}$ событий с высоким $S_t$ & Средний \\
+\textbf{Деградация} & Средняя ошибка за окно превысила $\epsilon_{max}$ & Высокий \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Параметры по умолчанию:}
+\begin{itemize}
+    \item $T_{sleep} = 300 \, \text{сек}$ (5 минут)
+    \item $N_{events} = 100$ событий с $S_t > \theta_{high}$
+    \item $\epsilon_{max} = 2.0 \cdot \mu_{baseline}$
+\end{itemize}
+
+\subsection{Процесс консолидации}
+
+Во время фазы сна выполняется перенос знаний из быстрых весов в медленные:
+
+\textbf{Шаг 1: Агрегация опыта}
+\begin{equation}
+U_{agg}^{(l)} = \frac{1}{N} \sum_{k=1}^{N} U_{final, k}^{(l)}
+\label{eq:aggregation}
+\end{equation}
+где $U_{final, k}^{(l)}$ — состояние быстрых весов после каждой сессии работы.
+
+\textbf{Шаг 2: Консолидация в целевые веса}
+\begin{equation}
+U_{target, new}^{(l)} = (1 - \zeta_{sleep}) \cdot U_{target, old}^{(l)} + \zeta_{sleep} \cdot U_{agg}^{(l)}
+\label{eq:consolidation}
+\end{equation}
+где $\zeta_{sleep} \in (0, 1)$ — скорость консолидации (по умолчанию $\zeta_{sleep} = 0.1$).
+
+\textbf{Шаг 3: Дистилляция в медленные веса}
+\begin{equation}
+W_{new}^{(l)} = W_{old}^{(l)} + \xi \cdot \nabla_W \mathcal{L}_{distill}(U_{target}, W)
+\label{eq:distillation}
+\end{equation}
+где $\mathcal{L}_{distill}$ — функция потерь дистилляции, $\xi$ — скорость обучения медленных весов.
+
+\subsection{Защита от забывания (EWC-lite)}
+
+Для предотвращения катастрофического забывания при обновлении медленных весов применяется упрощённая версия Elastic Weight Consolidation:
+
+\begin{equation}
+\mathcal{L}_{total} = \mathcal{L}_{distill} + \lambda_{EWC} \sum_i F_i \cdot (W_i - W_{i, old})^2
+\label{eq:ewc}
+\end{equation}
+где:
+\begin{itemize}
+    \item $F_i$ — диагональная аппроксимация матрицы Фишера (накапливается как скользящее среднее квадратов градиентов)
+    \item $W_{i, old}$ — значение веса до начала сна
+    \item $\lambda_{EWC} = 0.5$ (по умолчанию)
+\end{itemize}
+
+\textbf{Аппроксимация Фишера:}
+\begin{equation}
+F_{i, t+1} = (1 - \beta_F) \cdot F_{i, t} + \beta_F \cdot \left(\frac{\partial \mathcal{L}}{\partial W_i}\right)^2
+\label{eq:fisher}
+\end{equation}
+где $\beta_F = 0.01$ — коэффициент сглаживания.
+
+\section{Контекстная память (Context Memory)}
+
+\subsection{Структура контекстного вектора}
+
+Контекстный вектор $c_t \in \mathbb{R}^{d_{ctx}}$ хранит сжатое представление текущей последовательности в пространстве Fourier HRR.
+
+\textbf{Свойства:}
+\begin{itemize}
+    \item \textbf{Ёмкость:} Потенциально бесконечный контекст через связывание (binding).
+    \item \textbf{Дифференцируемость:} Все операции поддерживают backpropagation.
+    \item \textbf{Затухание:} Старая информация постепенно забывается.
+\end{itemize}
+
+\subsection{Обновление контекста}
+
+Контекст обновляется только в режимах \textbf{Routine} и \textbf{Learning}:
+\begin{equation}
+c_{t+1} = (1 - \gamma_{ctx}) \cdot c_t + \gamma_{ctx} \cdot \text{Bind}(c_t, \, \phi(h_t^{(L)}))
+\label{eq:context_update}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\gamma_{ctx} = 0.1$ — скорость обновления контекста
+    \item $\phi(\cdot)$ — проекция состояния верхнего слоя в пространство контекста
+    \item $\text{Bind}(\cdot)$ — операция связывания FHRR (раздел~\ref{subsec:context_binding})
+\end{itemize}
+
+\textbf{В режиме Shock:} $c_{t+1} = c_t$ (полная заморозка).
+
+\subsection{Очистка контекста}
+
+Контекст может быть сброшен явно при:
+\begin{itemize}
+    \item Завершении сессии (конец аудиофайла).
+    \item Детекции смены домена (резкая смена диктора/акустики).
+    \item Переполнении ёмкости (детекция коллизий через норму вектора).
+\end{itemize}
+
+\section{Сводная таблица компонентов памяти}
+
+\begin{table}[h]
+\centering
+\caption{Компоненты системы памяти}
+\label{tab:memory_components}
+\begin{tabular}{lp{3cm}p{2.5cm}p{3cm}p{3.5cm}}
+\toprule
+\textbf{Компонент} & \textbf{Тип} & \textbf{Размер} & \textbf{Обновление} & \textbf{Назначение} \\
+\midrule
+$U_t$ & Быстрые веса & $(d_{state} \times r)$ & Каждый шаг & Адаптация к контексту \\
+$W$ & Медленные веса & $(d_{state} \times d_{state})$ & Во время сна & Долгосрочные знания \\
+$U_{target}$ & Целевые веса & $(d_{state} \times r)$ & После сессии & Мост между $U$ и $W$ \\
+$c_t$ & Контекст & $(d_{ctx},)$ & Каждый шаг (не Shock) & Рабочая память \\
+$F_i$ & Фишер (EWC) & $(|W|,)$ & Каждый шаг & Защита от забывания \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Инварианты и ограничения}
+
+\begin{table}[h]
+\centering
+\caption{Инварианты системы памяти}
+\label{tab:memory_invariants}
+\begin{tabular}{lp{6cm}p{4cm}}
+\toprule
+\textbf{Инвариант} & \textbf{Формула} & \textbf{Назначение} \\
+\midrule
+Буферная целостность & \texttt{buffer\_active ≠ buffer\_shadow} & Гарантия разделения потоков \\
+Норма контекста & $\|c_t\|_2 \leq C_{max}$ & Предотвращение взрыва контекста \\
+Положительность Фишера & $F_i \geq 0$ & Корректность EWC-регуляризации \\
+Сумма консолидации & $\zeta_{sleep} \in (0, 1)$ & Стабильность обновления $U_{target}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Открытые вопросы и ограничения}
+
+Следующие аспекты архитектуры памяти требуют экспериментальной валидации:
+
+\begin{enumerate}
+    \item \textbf{Оптимальная частота сна:} Слишком частый сон может замедлить адаптацию, слишком редкий — привести к переполнению быстрых весов.
+    
+    \item \textbf{Ёмкость контекста:} Максимальная длина последовательности до деградации качества связывания FHRR не известна априори.
+    
+    \item \textbf{Баланс EWC:} Параметр $\lambda_{EWC}$ может требовать настройки под конкретную задачу для баланса между стабильностью и пластичностью.
+    
+    \item \textbf{Накладные расходы Double Buffering:} Дополнительная память может быть критична для устройств с ограниченным ресурсом.
+\end{enumerate}
+
+Эти вопросы рекомендуется включить в план абляционных тестов (см. раздел 7 спецификации).

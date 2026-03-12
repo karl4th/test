@@ -1,0 +1,276 @@
+\section{Обозначения и размерности (Notations)}
+
+Для обеспечения однозначности реализации вводится следующая система обозначений. Все переменные снабжены указанием размерности (shape), что критично для корректной реализации тензорных операций.
+
+\begin{table}[h]
+\centering
+\caption{Обозначения и размерности переменных}
+\label{tab:notations}
+\begin{tabular}{lllp{4cm}}
+\toprule
+\textbf{Символ} & \textbf{Описание} & \textbf{Размерность} & \textbf{Примечание} \\
+\midrule
+$x_t$ & Входной сигнал на шаге $t$ & $(d_{in},)$ & Например, аудио-фрейм \\
+$h_t^{(l)}$ & Скрытое состояние слоя $l$ & $(d_{state},)$ & $l \in \{1, 2, 3, 4\}$ \\
+$\hat{x}_t^{(l)}$ & Предсказание для слоя $l$ & $(d_{state},)$ & Генерируется слоем $l+1$ \\
+$e_t^{(l)}$ & Ошибка предсказания слоя $l$ & $(d_{state},)$ & $e_t = x_t - \hat{x}_t$ \\
+$W^{(l)}$ & Медленные веса (декодирование) & $(d_{state} \times d_{state})$ & Обучаются оффлайн/во сне \\
+$U_t^{(l)}$ & Быстрые веса (адаптация) & $(d_{state} \times r)$ & $r \leq 32$, низкий ранг \\
+$V^{(l)}$ & Проекционная матрица & $(d_{state} \times r)$ & Фиксирована или медленно обучается \\
+$c_t$ & Контекстный вектор & $(d_{ctx},)$ & Пространство Fourier HRR \\
+$S_t$ & Коэффициент удивления & $(1,)$ & Скаляр, $S_t \in [0, 1]$ \\
+$\alpha_t$ & Коэффициент восстановления & $(1,)$ & Для Ramp-up после шока \\
+$\mu_t, \sigma_t$ & Статистика ошибки & $(1,)$ & Бегущее среднее и отклонение \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Гиперпараметры по умолчанию:}
+\begin{itemize}
+    \item $d_{state} = 256$ (размерность скрытого состояния)
+    \item $d_{ctx} = 512$ (размерность контекстного вектора, степень двойки для FFT)
+    \item $r = 32$ (ранг быстрых весов)
+    \item $L = 4$ (количество слоёв иерархии)
+\end{itemize}
+
+\section{Иерархическое предиктивное кодирование (Hierarchical Predictive Coding)}
+
+Архитектура DREAM-Net строится на иерархии из $L$ слоёв, где каждый уровень генерирует предсказание для нижележащего уровня.
+
+\subsection{Генерация предсказания (Top-Down)}
+
+Для слоя $l$ на временном шаге $t$ предсказание $\hat{x}_t^{(l)}$ формируется как:
+\begin{equation}
+\hat{x}_t^{(l)} = W^{(l)} h_t^{(l)} + \text{Modulate}(c_t, h_t^{(l)})
+\label{eq:prediction}
+\end{equation}
+где $\text{Modulate}(\cdot)$ — функция топ-даун модуляции контекстом (см. раздел~\ref{subsec:context_binding}).
+
+\textbf{Размерности:}
+\[
+\hat{x}_t^{(l)} \in \mathbb{R}^{d_{state}}, \quad W^{(l)} \in \mathbb{R}^{d_{state} \times d_{state}}, \quad h_t^{(l)} \in \mathbb{R}^{d_{state}}
+\]
+
+\subsection{Вычисление ошибки восприятия (Prediction Error)}
+
+Ошибка предсказания для слоя $l$ вычисляется как разность между фактическим входом (или состоянием нижнего слоя) и предсказанием:
+\begin{equation}
+e_t^{(l)} = x_t^{(l)} - \hat{x}_t^{(l)}
+\label{eq:error}
+\end{equation}
+Для нижнего слоя ($l=1$): $x_t^{(1)} = x_t$ (внешний вход).
+
+Для верхних слоёв ($l > 1$): $x_t^{(l)} = h_t^{(l-1)}$ (состояние нижнего слоя).
+
+\subsection{Обновление скрытого состояния (Bottom-Up)}
+
+Скрытое состояние обновляется с учётом ошибки предсказания и быстрых весов:
+\begin{equation}
+h_{t+1}^{(l)} = f_{SSM}\left(h_t^{(l)}, \, u_t^{(l)}\right) + W_{error}^{(l)} e_t^{(l)}
+\label{eq:state_update}
+\end{equation}
+где:
+\begin{itemize}
+    \item $f_{SSM}(\cdot)$ — функция перехода состояния (например, CfC или линейная SSM-динамика)
+    \item $u_t^{(l)} = \left(B^{(l)} + U_t^{(l)} V^{(l)\top}\right) x_t^{(l)}$ — эффективный вход с учётом быстрых весов
+    \item $W_{error}^{(l)}$ — матрица инъекции ошибки (обучаемая, размерность $(d_{state} \times d_{state})$)
+\end{itemize}
+
+\textbf{Примечание:} В режиме \textbf{Shock} матрица $W_{error}^{(l)}$ для верхних слоёв ($l > 2$) обнуляется, что реализует рефлекторную дугу.
+
+\section{Статистический контроль удивления (Surprise Gate)}
+\label{sec:surprise_gate}
+
+Коэффициент удивления $S_t$ модулирует пластичность и переключение режимов работы.
+
+\subsection{Робастная оценка статистики ошибки}
+
+Для каждого слоя ведётся экспоненциально сглаженная оценка среднего и дисперсии нормы ошибки:
+\begin{equation}
+\mu_{t+1} = (1 - \beta) \mu_t + \beta \cdot \text{clip}\left(\|e_t\|, \, \mu_t, \, \mu_t + 3\sigma_t\right)
+\label{eq:mu_update}
+\end{equation}
+\begin{equation}
+\sigma_{t+1}^2 = (1 - \beta) \sigma_t^2 + \beta \cdot \left(\text{clip}\left(\|e_t\|, \, \mu_t, \, \mu_t + 3\sigma_t\right) - \mu_{t+1}\right)^2
+\label{eq:sigma_update}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\beta \in (0, 1)$ — коэффициент сглаживания (по умолчанию $\beta = 0.05$)
+    \item $\text{clip}(v, a, b) = \min(\max(v, a), b)$ — ограничение выбросов при обновлении статистики
+\end{itemize}
+
+\textbf{Обоснование:} Clipping предотвращает «раздувание» дисперсии одиночными выбросами, делая оценку робастной без необходимости вычисления медианы.
+
+\subsection{Вычисление коэффициента удивления}
+
+Нормированная ошибка преобразуется в скалярный коэффициент удивления:
+\begin{equation}
+z_t = \frac{\|e_t\| - \mu_t}{\sigma_t + \epsilon}
+\label{eq:z_score}
+\end{equation}
+\begin{equation}
+S_t = \sigma_{sigmoid}\left(\frac{z_t - \tau_{base}}{\gamma}\right)
+\label{eq:surprise}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\epsilon = 10^{-6}$ — численная стабильность
+    \item $\tau_{base}$ — базовый порог (адаптируется, см. раздел~\ref{subsec:threshold_adaptation})
+    \item $\gamma = 0.5$ — температура сигмоиды (по умолчанию)
+    \item $\sigma_{sigmoid}(\cdot)$ — логистическая функция
+\end{itemize}
+
+\textbf{Выходной диапазон:} $S_t \in (0, 1)$, где значения близкие к 1 указывают на высокую новизну.
+
+\subsection{Временное окно подтверждения (Confirmation Window)}
+
+Для входа в режим \textbf{Shock} требуется устойчивое превышение порога:
+\begin{equation}
+\text{ShockTrigger}_t = \mathbb{I}\left(\frac{1}{T_{win}} \sum_{k=0}^{T_{win}-1} S_{t-k} > \theta_{shock}\right)
+\label{eq:shock_trigger}
+\end{equation}
+где:
+\begin{itemize}
+    \item $T_{win} = 8 \, \text{мс} / \Delta t$ — количество шагов в окне подтверждения
+    \item $\theta_{shock} \approx \sigma_{sigmoid}((2.5 - \tau_{base})/\gamma)$ — порог для $2.5\sigma$
+    \item $\mathbb{I}(\cdot)$ — индикаторная функция
+\end{itemize}
+
+\section{Контекстное связывание (Fourier HRR Binding)}
+\label{subsec:context_binding}
+
+Контекстный вектор $c_t$ хранится в пространстве Fourier Hyperdimensional Representations (FHRR), что обеспечивает дифференцируемость операций связывания.
+
+\subsection{Представление контекста}
+
+Контекстный вектор представляется в частотной области:
+\begin{equation}
+\tilde{c}_t = \mathcal{F}(c_t) \in \mathbb{C}^{d_{ctx}}
+\label{eq:context_fft}
+\end{equation}
+где $\mathcal{F}(\cdot)$ — быстрое преобразование Фурье (FFT), $d_{ctx}$ — степень двойки.
+
+\subsection{Операция связывания (Binding)}
+
+Связывание контекста с паттерном памяти реализуется через поэлементное умножение в частотной области:
+\begin{equation}
+\text{Bind}(c_t, p) = \mathcal{F}^{-1}\left(\tilde{c}_t \odot \mathcal{F}(p)\right)
+\label{eq:binding}
+\end{equation}
+где:
+\begin{itemize}
+    \item $p \in \mathbb{R}^{d_{ctx}}$ — паттерн для связывания (например, проекция скрытого состояния)
+    \item $\odot$ — поэлементное умножение комплексных чисел
+    \item $\mathcal{F}^{-1}(\cdot)$ — обратное FFT
+\end{itemize}
+
+\textbf{Свойства:}
+\begin{itemize}
+    \item Операция дифференцируема (градиент течёт через FFT/IFFT).
+    \item Обратимость: $\text{Bind}(\text{Bind}(c, p), p^{-1}) \approx c$ при ортогональных $p$.
+\end{itemize}
+
+\subsection{Топ-даун модуляция контекстом}
+
+Контекст влияет на генерацию предсказания через модуляцию скрытого состояния:
+\begin{equation}
+\text{Modulate}(c_t, h_t^{(l)}) = W_{ctx}^{(l)} \cdot \text{Bind}(c_t, \, W_{proj}^{(l)} h_t^{(l)})
+\label{eq:modulation}
+\end{equation}
+где:
+\begin{itemize}
+    \item $W_{proj}^{(l)} \in \mathbb{R}^{d_{ctx} \times d_{state}}$ — проекция состояния в пространство контекста
+    \item $W_{ctx}^{(l)} \in \mathbb{R}^{d_{state} \times d_{ctx}}$ — обратная проекция с модуляцией
+\end{itemize}
+
+\textbf{Размерности согласованы:}
+\[
+h_t^{(l)} \xrightarrow{W_{proj}} \mathbb{R}^{d_{ctx}} \xrightarrow{\text{Bind}} \mathbb{R}^{d_{ctx}} \xrightarrow{W_{ctx}} \mathbb{R}^{d_{state}}
+\]
+
+\section{Пластичность быстрых весов (Fast Weight Plasticity)}
+
+Быстрые веса $U_t$ обновляются на каждом шаге инференса в зависимости от коэффициента удивления $S_t$.
+
+\subsection{Низкоранговая параметризация}
+
+Эффективная матрица адаптации представляется как:
+\begin{equation}
+\Delta W_t^{(l)} = U_t^{(l)} V^{(l)\top}, \quad U_t^{(l)} \in \mathbb{R}^{d_{state} \times r}, \quad V^{(l)} \in \mathbb{R}^{d_{state} \times r}
+\label{eq:low_rank}
+\end{equation}
+где $r \ll d_{state}$ (по умолчанию $r = 32$).
+
+\textbf{Преимущество:} Обновление $U_t$ требует $O(d_{state} \cdot r)$ операций вместо $O(d_{state}^2)$ для полной матрицы.
+
+\subsection{Уравнение обновления (STDP-подобное)}
+
+Обновление быстрых весов следует правилу, аналогичному Spike-Timing-Dependent Plasticity:
+\begin{equation}
+U_{t+1}^{(l)} = U_t^{(l)} + \eta \cdot S_t \cdot \left(h_t^{(l)} \otimes e_t^{(l)}\right) V^{(l)} - \lambda_{decay} \left(U_t^{(l)} - U_{target}^{(l)}\right)
+\label{eq:plasticity}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\eta > 0$ — скорость пластичности (по умолчанию $\eta = 0.01$)
+    \item $\otimes$ — внешнее произведение векторов (outer product)
+    \item $\lambda_{decay} > 0$ — коэффициент затухания к целевому значению
+    \item $U_{target}^{(l)}$ — целевое значение (обновляется во время фазы сна)
+\end{itemize}
+
+\textbf{Размерности:}
+\[
+h_t^{(l)} \otimes e_t^{(l)} \in \mathbb{R}^{d_{state} \times d_{state}}, \quad \left(h_t^{(l)} \otimes e_t^{(l)}\right) V^{(l)} \in \mathbb{R}^{d_{state} \times r}
+\]
+
+\subsection{Ограничение нормы весов (Weight Clipping)}
+
+Для обеспечения численной устойчивости норма быстрых весов ограничивается:
+\begin{equation}
+U_{t+1}^{(l)} \leftarrow \text{clip\_norm}\left(U_{t+1}^{(l)}, \, U_{max}\right)
+\label{eq:weight_clip}
+\end{equation}
+\begin{equation}
+\text{clip\_norm}(U, U_{max}) = U \cdot \min\left(1, \, \frac{U_{max}}{\|U\|_F + \epsilon}\right)
+\label{eq:clip_norm}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\|U\|_F$ — норма Фробениуса
+    \item $U_{max} = 10.0$ (по умолчанию, подбирается экспериментально)
+\end{itemize}
+
+\section{Сводная таблица уравнений}
+
+\begin{table}[h]
+\centering
+\caption{Сводка основных уравнений архитектуры}
+\label{tab:equations_summary}
+\begin{tabular}{lp{8cm}l}
+\toprule
+\textbf{Блок} & \textbf{Уравнение} & \textbf{Раздел} \\
+\midrule
+Предсказание & $\hat{x}_t^{(l)} = W^{(l)} h_t^{(l)} + \text{Modulate}(c_t, h_t^{(l)})$ & \ref{eq:prediction} \\
+Ошибка & $e_t^{(l)} = x_t^{(l)} - \hat{x}_t^{(l)}$ & \ref{eq:error} \\
+Состояние & $h_{t+1}^{(l)} = f_{SSM}(h_t^{(l)}, u_t^{(l)}) + W_{error}^{(l)} e_t^{(l)}$ & \ref{eq:state_update} \\
+Статистика & $\mu_{t+1} = (1-\beta)\mu_t + \beta \cdot \text{clip}(\|e_t\|, \dots)$ & \ref{eq:mu_update} \\
+Удивление & $S_t = \sigma_{sigmoid}((\|e_t\| - \mu_t)/(\sigma_t \cdot \gamma))$ & \ref{eq:surprise} \\
+Контекст & $\text{Bind}(c_t, p) = \mathcal{F}^{-1}(\mathcal{F}(c_t) \odot \mathcal{F}(p))$ & \ref{eq:binding} \\
+Пластичность & $U_{t+1} = U_t + \eta S_t (h \otimes e)V - \lambda_{decay}(U - U_{target})$ & \ref{eq:plasticity} \\
+Стабильность & $U \leftarrow \text{clip\_norm}(U, U_{max})$ & \ref{eq:clip_norm} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Примечания к реализации}
+
+\begin{enumerate}
+    \item \textbf{FFT оптимизация:} Размерность контекста $d_{ctx}$ должна быть степенью двойки (256, 512, 1024) для эффективного вычисления FFT на различных платформах.
+    
+    \item \textbf{Комплексные числа:} При реализации FHRR в PyTorch использовать \texttt{torch.fft.rfft} для вещественных входов (экономия памяти в 2 раза).
+    
+    \item \textbf{Outer product:} Операция $h \otimes e$ может быть вычислительно дорогой для больших $d_{state}$. Рекомендуется использовать батчевое умножение или аппроксимацию через случайные проекции при необходимости.
+    
+    \item \textbf{Градиентный поток:} Все операции в разделах 2.3–2.5 дифференцируемы, что позволяет обучать параметры $W$, $V$, $W_{ctx}$ через стандартный backpropagation во время фазы сна.
+\end{enumerate}

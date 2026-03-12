@@ -1,0 +1,534 @@
+\section{Обзор раздела}
+
+Данный раздел описывает практические аспекты реализации архитектуры DREAM-Net. Цель — предоставить разработчикам достаточную информацию для корректной реализации без двусмысленностей, сохраняя при этом гибкость для оптимизации под конкретные платформы.
+
+\textbf{Важное замечание:} Все представленные значения гиперпараметров являются предварительными рекомендациями на основе теоретического анализа и ограниченных предварительных тестов. Они могут требовать настройки под конкретные задачи и датасеты.
+
+\section{Программный интерфейс (API Specification)}
+
+\subsection{Основной класс модели}
+
+\begin{lstlisting}[language=Python, caption={Интерфейс класса DREAMNet}, label={lst:dream_class}]
+class DREAMNet:
+    """
+    DREAM-Net: Dynamic Recall and Elastic Adaptive Memory
+
+    Архитектура с онлайн-пластичностью и двухмасштабной памятью.
+    """
+
+    def __init__(self, config: DREAMConfig):
+        """
+        Инициализация модели.
+
+        Args:
+            config: Конфигурация с гиперпараметрами
+        """
+        pass
+
+    def step(self, x_t: Tensor, state: Optional[State] = None) -> StepOutput:
+        """
+        Один шаг инференса с возможностью адаптации.
+
+        Args:
+            x_t: Входной сигнал на шаге t, shape (d_in,)
+            state: Скрытое состояние (опционально, создаётся если None)
+
+        Returns:
+            StepOutput с полями:
+                - h_next: Новое скрытое состояние
+                - prediction: Предсказание модели
+                - surprise: Коэффициент удивления S_t
+                - mode: Текущий режим (Routine/Learning/Shock)
+        """
+        pass
+
+    def sleep(self, priority: int = 0) -> SleepResult:
+        """
+        Асинхронная фаза консолидации памяти.
+
+        Args:
+            priority: Приоритет задачи (для планировщика)
+
+        Returns:
+            SleepResult с полями:
+                - consolidated: Количество консолидированных паттернов
+                - duration: Длительность фазы сна (мс)
+                - success: Флаг успешного завершения
+        """
+        pass
+
+    def get_state(self) -> ModelState:
+        """
+        Получение текущего состояния для сериализации.
+
+        Returns:
+            ModelState с полями:
+                - slow_weights: W (медленные веса)
+                - fast_weights: U (быстрые веса)
+                - context: c_t (контекстный вектор)
+                - statistics: μ, σ (статистика ошибки)
+                - config: Конфигурация модели
+        """
+        pass
+
+    def load_state(self, state: ModelState) -> bool:
+        """
+        Загрузка состояния из сериализованного представления.
+
+        Args:
+            state: ModelState для загрузки
+
+        Returns:
+            True если загрузка успешна, False иначе
+        """
+        pass
+
+    def reset(self, hard: bool = False):
+        """
+        Сброс состояния модели.
+
+        Args:
+            hard: Если True, сбрасывает также быстрые веса и статистику
+        """
+        pass
+\end{lstlisting}
+
+\subsection{Структуры данных}
+
+\begin{lstlisting}[language=Python, caption={Структуры данных}, label={lst:data_structures}]
+@dataclass
+class DREAMConfig:
+    """Конфигурация модели"""
+    d_state: int = 256          # Размерность скрытого состояния
+    d_ctx: int = 512            # Размерность контекста (степень двойки)
+    d_in: int = 80              # Размерность входа (например, mel-спектр)
+    rank: int = 32              # Ранг быстрых весов
+    n_layers: int = 4           # Количество слоёв иерархии
+
+    # Surprise Gate
+    tau_base: float = 0.5       # Базовый порог удивления
+    gamma: float = 0.5          # Температура сигмоиды
+    beta_stat: float = 0.05     # Сглаживание статистики
+
+    # State Machine
+    theta_learn_enter: float = 0.7    # Вход в Learning (в сигмах)
+    theta_learn_exit: float = 0.3     # Выход из Learning
+    theta_shock_enter: float = 2.5    # Вход в Shock
+    theta_shock_exit: float = 1.8     # Выход из Shock
+    shock_window_ms: int = 8          # Окно подтверждения шока (мс)
+
+    # Plasticity
+    eta_plasticity: float = 0.01      # Скорость пластичности
+    lambda_decay: float = 0.001       # Затухание быстрых весов
+    u_max: float = 10.0               # Максимальная норма U
+
+    # Sleep
+    sleep_trigger_events: int = 100   # Событий для триггера сна
+    sleep_trigger_time_sec: int = 300 # Время для триггера сна
+    zeta_sleep: float = 0.1           # Скорость консолидации
+    lambda_ewc: float = 0.5           # Коэффициент EWC
+
+    # Safety
+    ramp_duration_ms: int = 50        # Длительность рампы восстановления
+    shock_max_duration_ms: int = 500  # Максимальная длительность шока
+    sigma_min: float = 1e-4           # Минимальная дисперсия
+
+
+@dataclass
+class State:
+    """Скрытое состояние модели"""
+    h: List[Tensor]           # Скрытые состояния по слоям
+    U: List[Tensor]           # Быстрые веса по слоям
+    c: Tensor                 # Контекстный вектор
+    mu: float                 # Бегущее среднее ошибки
+    sigma: float              # Бегущее отклонение ошибки
+    mode: int                 # Текущий режим (0=Routine, 1=Learning, 2=Shock)
+    alpha_ramp: float         # Коэффициент рампы
+    shock_counter: int        # Счётчик окна шока
+    tau_base: float           # Адаптивный базовый порог
+
+
+@dataclass
+class StepOutput:
+    """Результат шага инференса"""
+    h_next: List[Tensor]
+    prediction: Tensor
+    surprise: float
+    mode: int
+    error_norm: float
+
+
+@dataclass
+class SleepResult:
+    """Результат фазы сна"""
+    consolidated: int
+    duration_ms: float
+    success: bool
+    weights_updated: bool
+\end{lstlisting}
+
+\subsection{Callback-интерфейсы}
+
+\begin{lstlisting}[language=Python, caption={Callback-интерфейсы}, label={lst:callbacks}]
+class DREAMCallback:
+    """Интерфейс для событий модели"""
+
+    def on_mode_change(self, old_mode: int, new_mode: int, step: int):
+        """Вызывается при смене режима работы"""
+        pass
+
+    def on_sleep_start(self, trigger_reason: str):
+        """Вызывается при начале фазы сна"""
+        pass
+
+    def on_sleep_end(self, result: SleepResult):
+        """Вызывается при завершении фазы сна"""
+        pass
+
+    def on_anomaly_detected(self, surprise: float, step: int):
+        """Вызывается при детекции аномалии (S_t > threshold)"""
+        pass
+
+    def on_numerical_warning(self, tensor_name: str, issue: str):
+        """Вызывается при детекции численных проблем (NaN, Inf, clipping)"""
+        pass
+\end{lstlisting}
+
+\section{Гиперпараметры по умолчанию}
+
+\subsection{Архитектурные параметры}
+
+\begin{table}[h]
+\centering
+\caption{Архитектурные гиперпараметры}
+\label{tab:hyper_arch}
+\begin{tabular}{lcp{2cm}p{2.5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Символ} & \textbf{Значение} & \textbf{Диапазон} & \textbf{Обоснование} \\
+\midrule
+Размерность состояния & $d_{state}$ & 256 & 128–512 & Баланс ёмкости и эффективности \\
+Размерность контекста & $d_{ctx}$ & 512 & 256–1024 & Степень двойки для FFT \\
+Ранг быстрых весов & $r$ & 32 & 16–64 & Низкоранговая аппроксимация \\
+Количество слоёв & $L$ & 4 & 3–6 & Иерархия предиктивного кодирования \\
+Размерность входа & $d_{in}$ & 80 & --- & Зависит от фич (mel-спектр) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Параметры Surprise Gate}
+
+\begin{table}[h]
+\centering
+\caption{Параметры Surprise Gate}
+\label{tab:hyper_surprise}
+\begin{tabular}{lcp{2cm}p{2.5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Символ} & \textbf{Значение} & \textbf{Диапазон} & \textbf{Обоснование} \\
+\midrule
+Базовый порог & $\tau_{base}$ & 0.5 & 0.3–0.7 & Средняя чувствительность \\
+Температура & $\gamma$ & 0.5 & 0.3–1.0 & Крутизна сигмоиды \\
+Сглаживание статистики & $\beta$ & 0.05 & 0.01–0.1 & Скорость адаптации $\mu, \sigma$ \\
+Минимальная дисперсия & $\sigma_{min}$ & $10^{-4}$ & $10^{-5}$–$10^{-3}$ & Защита от деления на ноль \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Параметры State Machine}
+
+\begin{table}[h]
+\centering
+\caption{Параметры машины состояний}
+\label{tab:hyper_fsm}
+\begin{tabular}{lcp{2cm}p{2.5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Символ} & \textbf{Значение} & \textbf{Диапазон} & \textbf{Обоснование} \\
+\midrule
+Вход в Learning & $\theta_{learn}^{enter}$ & $0.7\sigma$ & 0.5–1.0$\sigma$ & Умеренная новизна \\
+Выход из Learning & $\theta_{learn}^{exit}$ & $0.3\sigma$ & 0.2–0.5$\sigma$ & Гистерезис 0.4$\sigma$ \\
+Вход в Shock & $\theta_{shock}^{enter}$ & $2.5\sigma$ & 2.0–3.0$\sigma$ & Аномалия \\
+Выход из Shock & $\theta_{shock}^{exit}$ & $1.8\sigma$ & 1.5–2.0$\sigma$ & Гистерезис 0.7$\sigma$ \\
+Окно подтверждения & $T_{win}$ & 8 мс & 5–15 мс & Фильтрация импульсов \\
+Макс. длительность шока & $T_{shock\_max}$ & 500 мс & 200–1000 мс & Защита от зависания \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Параметры пластичности}
+
+\begin{table}[h]
+\centering
+\caption{Параметры пластичности}
+\label{tab:hyper_plasticity}
+\begin{tabular}{lcp{2cm}p{2.5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Символ} & \textbf{Значение} & \textbf{Диапазон} & \textbf{Обоснование} \\
+\midrule
+Скорость пластичности & $\eta$ & 0.01 & 0.001–0.1 & Скорость обновления $U$ \\
+Затухание быстрых весов & $\lambda_{decay}$ & 0.001 & 0.0001–0.01 & Возврат к $U_{target}$ \\
+Макс. норма $U$ & $U_{max}$ & 10.0 & 5.0–20.0 & Ограничение весов \\
+Скорость консолидации & $\zeta_{sleep}$ & 0.1 & 0.05–0.2 & Перенос $U \to W$ \\
+Коэффициент EWC & $\lambda_{EWC}$ & 0.5 & 0.1–1.0 & Защита от забывания \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Параметры восстановления}
+
+\begin{table}[h]
+\centering
+\caption{Параметры восстановления}
+\label{tab:hyper_recovery}
+\begin{tabular}{lcp{2cm}p{2.5cm}p{4cm}}
+\toprule
+\textbf{Параметр} & \textbf{Символ} & \textbf{Значение} & \textbf{Диапазон} & \textbf{Обоснование} \\
+\midrule
+Длительность рампы & $T_{ramp}$ & 50 мс & 20–100 мс & Плавное восстановление \\
+Затухание порога & $\delta_{decay}$ & 0.01 & 0.005–0.02 & Возврат $\tau_{base}$ к норме \\
+Повышение порога & $\delta_{up}$ & 0.10 & 0.05–0.15 & Адаптация в шоке \\
+Потолок порога & $\tau_{max}$ & $3.0 \cdot \tau_0$ & 2–5$\cdot \tau_0$ & Макс. адаптация \\
+Пол порога & $\tau_{min}$ & $0.5 \cdot \tau_0$ & 0.3–0.7$\cdot \tau_0$ & Мин. адаптация \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Структура кода (Recommended Code Structure)}
+
+\begin{lstlisting}[language=bash, caption={Рекомендуемая структура проекта}, label={lst:project_structure}]
+dream_net/
+├── __init__.py
+├── config.py                 # DREAMConfig, presets
+├── model/
+│   ├── __init__.py
+│   ├── dream_net.py          # Основной класс DREAMNet
+│   ├── layers/
+│   │   ├── __init__.py
+│   │   ├── predictive_layer.py    # Слой предиктивного кодирования
+│   │   ├── surprise_gate.py       # Surprise Gate
+│   │   └── context_module.py      # FHRR контекст
+│   ├── memory/
+│   │   ├── __init__.py
+│   │   ├── fast_weights.py        # Быстрые веса U
+│   │   ├── slow_weights.py        # Медленные веса W
+│   │   └── double_buffer.py       # Double Buffering
+│   └── state_machine/
+│       ├── __init__.py
+│       ├── fsm.py                 # Конечный автомат
+│       └── modes.py               # Режимы (Routine/Learning/Shock)
+├── training/
+│   ├── __init__.py
+│   ├── sleep_cycle.py             # Фаза сна
+│   ├── consolidation.py           # Консолидация
+│   └── ewc.py                     # EWC-регуляризация
+├── utils/
+│   ├── __init__.py
+│   ├── statistics.py              # Robust Sigma
+│   ├── numerical.py               # Clipping, stability checks
+│   └── callbacks.py               # Callback-интерфейсы
+├── tests/
+│   ├── __init__.py
+│   ├── test_step.py               # Тесты шага инференса
+│   ├── test_sleep.py              # Тесты фазы сна
+│   ├── test_stability.py          # Тесты численной устойчивости
+│   └── test_concurrency.py        # Тесты потокобезопасности
+└── examples/
+    ├── __init__.py
+    ├── basic_asr.py               # Пример ASR
+    ├── speaker_adaptation.py      # Пример адаптации к диктору
+    └── noise_robustness.py        # Пример работы с шумом
+\end{lstlisting}
+
+\section{Зависимости и требования}
+
+\subsection{Программные зависимости}
+
+\begin{table}[h]
+\centering
+\caption{Программные зависимости}
+\label{tab:dependencies}
+\begin{tabular}{lp{3cm}p{6cm}}
+\toprule
+\textbf{Зависимость} & \textbf{Минимальная версия} & \textbf{Назначение} \\
+\midrule
+Python & 3.9 & Язык реализации \\
+PyTorch & 2.0 & Тензорные операции, FFT \\
+NumPy & 1.20 & Вспомогательные вычисления \\
+threading/asyncio & --- & Асинхронный сон \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Аппаратные требования}
+
+\begin{table}[h]
+\centering
+\caption{Аппаратные требования}
+\label{tab:hardware}
+\begin{tabular}{lpp{6cm}}
+\toprule
+\textbf{Компонент} & \textbf{Минимум} & \textbf{Рекомендуется} \\
+\midrule
+CPU & 4 ядра & 8+ ядер (для асинхронного сна) \\
+RAM & 2 GB & 4+ GB (Double Buffering) \\
+GPU & Опционально & CUDA 11+ для ускорения FFT \\
+Storage & 100 MB & 500 MB (для логов и чекпоинтов) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Оценка вычислительной сложности}
+
+\begin{table}[h]
+\centering
+\caption{Вычислительная сложность операций}
+\label{tab:complexity}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Операция} & \textbf{Сложность} & \textbf{Примечание} \\
+\midrule
+Шаг инференса & $O(L \cdot d_{state} \cdot r)$ & Линейная от ранга \\
+Обновление контекста & $O(d_{ctx} \log d_{ctx})$ & FFT/IFFT \\
+Фаза сна & $O(|W| + |U|)$ & Только при триггере \\
+Память на шаг & $O(L \cdot d_{state} + d_{ctx})$ & Константна от длины последовательности \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Интеграционные рекомендации}
+
+\subsection{Интеграция с ASR-пайплайном}
+
+\begin{lstlisting}[language=Python, caption={Пример интеграции с аудио-пайплайном}, label={lst:asr_integration}]
+# Пример интеграции с аудио-пайплайном
+import torch
+from dream_net import DREAMNet, DREAMConfig
+
+# Инициализация
+config = DREAMConfig(d_in=80)  # 80 mel-фильтров
+model = DREAMNet(config)
+
+# Обработка аудио-потока
+for audio_frame in audio_stream:
+    # Предобработка (mel-спектр)
+    x_t = extract_mel_features(audio_frame)
+
+    # Шаг инференса
+    output = model.step(x_t)
+
+    # Использование предсказания
+    if output.surprise > 0.8:
+        logger.warning(f"High surprise detected: {output.surprise}")
+
+    # Декодирование выхода (интеграция с CTC/Transducer)
+    phoneme_probs = decoder(output.prediction)
+
+    # Асинхронный сон (в отдельном потоке)
+    if sleep_trigger.check():
+        threading.Thread(target=model.sleep).start()
+\end{lstlisting}
+
+\subsection{Серверная развёртка}
+
+Для серверной развёртки рекомендуется:
+
+\begin{enumerate}
+    \item \textbf{Контейнеризация:} Docker с предустановленными зависимостями.
+    \item \textbf{Мониторинг:} Экспорт метрик (surprise\_rate, mode\_distribution, sleep\_frequency) в Prometheus.
+    \item \textbf{Логирование:} Структурированные логи (JSON) с возможностью фильтрации по режимам.
+    \item \textbf{Graceful shutdown:} Корректное завершение фазы сна перед остановкой сервиса.
+\end{enumerate}
+
+\subsection{Edge-развёртка}
+
+Для устройств с ограниченными ресурсами:
+
+\begin{enumerate}
+    \item \textbf{Квантование:} INT8 для медленных весов $W$ (быстрые веса $U$ остаются FP32).
+    \item \textbf{Отключение отладки:} Проверки \texttt{isfinite()} только в debug-сборках.
+    \item \textbf{Упрощённый сон:} Синхронная фаза сна с блокировкой инференса.
+    \item \textbf{Снижение ранга:} $r = 16$ вместо 32 для экономии памяти.
+\end{enumerate}
+
+\section{Отладка и диагностика}
+
+\subsection{Рекомендуемые метрики для логирования}
+
+\begin{table}[h]
+\centering
+\caption{Метрики для логирования}
+\label{tab:logging_metrics}
+\begin{tabular}{lp{4cm}p{5cm}}
+\toprule
+\textbf{Метрика} & \textbf{Частота} & \textbf{Назначение} \\
+\midrule
+\texttt{surprise\_mean} & Каждые 100 шагов & Средняя новизна \\
+\texttt{mode\_distribution} & Каждые 1000 шагов & Доля времени в режимах \\
+\texttt{U\_norm\_mean} & Каждые 100 шагов & Дрифт быстрых весов \\
+\texttt{sleep\_frequency} & Каждые 10 минут & Частота консолидации \\
+\texttt{clipping\_count} & Каждые 100 шагов & Срабатывания защит \\
+\texttt{nan\_inf\_count} & Каждый шаг & Численные ошибки \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Чек-лист перед продакшном}
+
+\begin{itemize}
+    \item[$\square$] Все unit-тесты проходят (test\_step, test\_sleep, test\_stability)
+    \item[$\square$] Интеграционные тесты с реальными данными
+    \item[$\square$] Стресс-тест (100+ часов непрерывной работы без NaN/Inf)
+    \item[$\square$] Проверка Double Buffering на гонки данных
+    \item[$\square$] Валидация на независимом тестовом наборе
+    \item[$\square$] Документация API актуализирована
+    \item[$\square$] Конфигурационные файлы вынесены из кода
+\end{itemize}
+
+\section{Известные ограничения и будущая работа}
+
+\subsection{Текущие ограничения}
+
+\begin{table}[h]
+\centering
+\caption{Текущие ограничения}
+\label{tab:limitations}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Ограничение} & \textbf{Влияние} & \textbf{Временное решение} \\
+\midrule
+FFT на CPU медленно & Задержка на Edge & Использовать rfft, снизить $d_{ctx}$ \\
+Сон блокирует на Edge & Фризы инференса & Синхронный сон с приоритетом \\
+Гиперпараметры требуют настройки & Время на валидацию & Пресеты для распространённых задач \\
+Нет официальных бенчмарков & Сложно сравнить & Внутренние тесты на LJSpeech \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Направления будущей работы}
+
+\begin{enumerate}
+    \item \textbf{Автоматическая настройка гиперпараметров} — Bayesian Optimization для $\eta, \lambda_{decay}, \tau_{base}$.
+    
+    \item \textbf{Расширение на мультимодальность} — Интеграция визуального контекста.
+    
+    \item \textbf{Распределённый сон} — Консолидация на сервере для Edge-устройств.
+    
+    \item \textbf{Формальная верификация} — Доказательство устойчивости через Lyapunov-функции.
+\end{enumerate}
+
+\section{Лицензирование и воспроизводимость}
+
+\textbf{Рекомендация:} Для обеспечения воспроизводимости исследований:
+
+\begin{enumerate}
+    \item Фиксировать версию кода (Git commit hash) для каждого эксперимента.
+    \item Сохранять конфигурационные файлы вместе с весами модели.
+    \item Публиковать seed для генераторов случайных чисел.
+    \item Документировать версию зависимостей (torch, numpy, cuda).
+\end{enumerate}
+
+\textbf{Лицензия:} Рекомендуется открытая лицензия (MIT/Apache 2.0) для исследовательских целей с указанием авторства.
+
+\section{Заключение раздела}
+
+Данный раздел завершает техническую спецификацию DREAM-Net v1.0. Представленные интерфейсы, гиперпараметры и рекомендации по реализации предназначены для обеспечения корректной и воспроизводимой реализации архитектуры.
+
+Все компоненты спецификации являются предметом дальнейшей экспериментальной валидации. Разработчикам рекомендуется начинать с базовой конфигурации и проводить абляционные тесты для настройки под конкретные задачи.

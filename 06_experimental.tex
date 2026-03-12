@@ -1,0 +1,317 @@
+\section{Цели экспериментальной валидации}
+
+Данный раздел описывает план экспериментальной проверки архитектуры DREAM-Net. Все представленные в предыдущих разделах механизмы являются гипотезами, требующими эмпирической верификации.
+
+\textbf{Основные цели:}
+\begin{enumerate}
+    \item Подтвердить работоспособность архитектуры на задачах обработки последовательностей.
+    \item Оценить преимущество онлайн-адаптации перед статическими архитектурами.
+    \item Проверить устойчивость системы к нестационарным данным и шуму.
+    \item Количественно измерить влияние отдельных компонентов через абляционные тесты.
+\end{enumerate}
+
+\textbf{Важное замечание:} Результаты, представленные в черновиках спецификации (например, loss 0.0024 на LJSpeech), являются предварительными и требуют воспроизведения в контролируемых условиях с указанием дисперсии и статистической значимости.
+
+\section{Задачи и датасеты}
+
+\subsection{Базовая задача ASR (Automatic Speech Recognition)}
+
+\textbf{Датасет:} LJSpeech (английский, один диктор)
+
+\begin{table}[h]
+\centering
+\caption{Параметры датасета LJSpeech}
+\label{tab:ljspeech}
+\begin{tabular}{lp{8cm}}
+\toprule
+\textbf{Параметр} & \textbf{Значение} \\
+\midrule
+Объём & $\sim$24 часа речи \\
+Частота дискретизации & 22.05 кГц \\
+Разметка & Текст на уровне предложений \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Цель:} Базовая валидация сходимости модели на стандартном датасете.
+
+\textbf{Метрики:}
+\begin{itemize}
+    \item Character Error Rate (CER)
+    \item Word Error Rate (WER)
+    \item Функция потерь (Loss) по эпохам
+\end{itemize}
+
+\subsection{Задача адаптации к диктору}
+
+\textbf{Датасет:} Mozilla Common Voice (множество дикторов)
+
+\begin{table}[h]
+\centering
+\caption{Параметры датасета Common Voice}
+\label{tab:commonvoice}
+\begin{tabular}{lp{8cm}}
+\toprule
+\textbf{Параметр} & \textbf{Значение} \\
+\midrule
+Количество дикторов & $\geq 100$ \\
+Языки & Английский, Русский (опционально) \\
+Разметка & Текст + ID диктора \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Протокол теста «Смена диктора»:}
+\begin{enumerate}
+    \item Модель обучается на дикторах A, B, C.
+    \item Во время инференса происходит переключение на диктора D (не виден при обучении).
+    \item Измеряется количество шагов до восстановления базовой точности.
+\end{enumerate}
+
+\textbf{Гипотеза:} DREAM-Net восстановит точность за $< 50$ шагов благодаря быстрым весам $U$, тогда как статические модели потребуют fine-tuning.
+
+\subsection{Задача робастности к шуму}
+
+\textbf{Датасет:} LJSpeech + искусственный шум
+
+\begin{table}[h]
+\centering
+\caption{Типы и интенсивность шума}
+\label{tab:noise}
+\begin{tabular}{lp{6cm}}
+\toprule
+\textbf{Тип шума} & \textbf{Интенсивность (SNR)} \\
+\midrule
+Белый шум & 0 dB, 10 dB, 20 dB \\
+Розовый шум & 0 dB, 10 dB, 20 dB \\
+Реверберация & T60 = 0.3s, 0.6s, 0.9s \\
+Фоновая речь & 1 говорящий, 3 говорящих \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Цель:} Проверить эффективность Surprise Gate в фильтрации аномалий.
+
+\textbf{Метрика:} CER в зависимости от SNR (кривая деградации).
+
+\section{Базовые архитектуры для сравнения (Baselines)}
+
+Для корректной оценки необходимо сравнение с современными архитектурами аналогичной ёмкости.
+
+\begin{table}[h]
+\centering
+\caption{Базовые архитектуры для сравнения}
+\label{tab:baselines}
+\begin{tabular}{lcp{6cm}}
+\toprule
+\textbf{Архитектура} & \textbf{Параметры} & \textbf{Обоснование выбора} \\
+\midrule
+\textbf{LSTM} & $\sim$100k & Классическая RNN-базлайн \\
+\textbf{GRU} & $\sim$100k & Упрощённая рекуррентная архитектура \\
+\textbf{Transformer (Small)} & $\sim$500k & Attention-based, квадратичная сложность \\
+\textbf{Mamba / SSM} & $\sim$100k & Линейная сложность, состояние \\
+\textbf{CfC (Liquid Networks)} & $\sim$100k & Непрерывная динамика, биовдохновлённая \\
+\textbf{DREAM-Net} & $\sim$82k & Предлагаемая архитектура \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Важно:} Все модели должны быть обучены на одинаковых данных, с одинаковой предобработкой и аугментацией для честного сравнения.
+
+\section{Ключевые метрики оценки}
+
+\subsection{Метрики точности}
+
+\begin{table}[h]
+\centering
+\caption{Метрики точности}
+\label{tab:accuracy_metrics}
+\begin{tabular}{lp{6cm}p{4cm}}
+\toprule
+\textbf{Метрика} & \textbf{Формула} & \textbf{Назначение} \\
+\midrule
+\textbf{CER} & $\frac{S + D + I}{N} \times 100\%$ & Точность на уровне символов \\
+\textbf{WER} & $\frac{S + D + I}{N} \times 100\%$ & Точность на уровне слов \\
+\textbf{Loss} & $\mathcal{L}_{total}$ & Сходимость обучения \\
+\bottomrule
+\end{tabular}
+\end{table}
+где $S$ — замены, $D$ — удаления, $I$ — вставки, $N$ — общее количество единиц.
+
+\subsection{Метрики адаптивности}
+
+\begin{table}[h]
+\centering
+\caption{Метрики адаптивности}
+\label{tab:adaptivity_metrics}
+\begin{tabular}{lp{6cm}l}
+\toprule
+\textbf{Метрика} & \textbf{Описание} & \textbf{Единица} \\
+\midrule
+\textbf{Adaptation Time} & Шагов до восстановления CER после смены диктора & шаги \\
+\textbf{Surprise Correlation} & Корреляция $S_t$ с реальными аномалиями & коэффициент Пирсона \\
+\textbf{Plasticity Ratio} & Доля шагов с активным обновлением $U$ & процент \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Метрики эффективности}
+
+\begin{table}[h]
+\centering
+\caption{Метрики эффективности}
+\label{tab:efficiency_metrics}
+\begin{tabular}{lp{6cm}l}
+\toprule
+\textbf{Метрика} & \textbf{Описание} & \textbf{Единица} \\
+\midrule
+\textbf{Parameters} & Общее количество обучаемых параметров & count \\
+\textbf{FLOPs/step} & Операций на один шаг инференса & FLOPs \\
+\textbf{Memory/step} & Памяти на один шаг (включая контекст) & MB \\
+\textbf{Real-time Factor} & Время обработки / длительность аудио & коэффициент \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Метрики стабильности}
+
+\begin{table}[h]
+\centering
+\caption{Метрики стабильности}
+\label{tab:stability_metrics}
+\begin{tabular}{lp{6cm}l}
+\toprule
+\textbf{Метрика} & \textbf{Описание} & \textbf{Единица} \\
+\midrule
+\textbf{Forgetting Rate} & Деградация CER на старых дикторах после сна & \% \\
+\textbf{Shock Frequency} & Среднее количество входов в Shock per минуту & count/min \\
+\textbf{Weight Drift} & $\|U_t - U_{target}\|_F$ за сессию & норма \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Абляционные тесты}
+
+Для оценки вклада отдельных компонентов архитектуры предлагается следующая серия абляционных тестов:
+
+\begin{table}[h]
+\centering
+\caption{Абляционные тесты}
+\label{tab:ablation}
+\begin{tabular}{lp{5cm}p{5cm}}
+\toprule
+\textbf{Тест} & \textbf{Модификация} & \textbf{Гипотеза} \\
+\midrule
+\textbf{A-1} & Без Surprise Gate ($S_t = 1$ всегда) & Увеличится переобучение на шуме \\
+\textbf{A-2} & Без фазы сна (нет консолидации) & Увеличится forgetting rate \\
+\textbf{A-3} & Без быстрых весов ($U_t = 0$) & Снизится адаптивность к диктору \\
+\textbf{A-4} & Без контекста ($c_t = 0$) & Ухудшится работа на длинных последовательностях \\
+\textbf{A-5} & Без гистерезиса (мгновенные переходы) & Увеличится дребезг режимов \\
+\textbf{A-6} & Без Ramp-up (мгновенное восстановление) & Возможны вторичные шоки \\
+\textbf{A-7} & Без Double Buffering (синхронный сон) & Блокировки инференса во время сна \\
+\textbf{A-8} & Без Clipping весов & Риск численной нестабильности \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Протокол:} Каждый тест запускается на полном наборе задач (6.2.1–6.2.3). Результаты сравниваются с полной версией DREAM-Net.
+
+\section{Протокол валидации}
+
+\subsection{Разделение данных}
+
+\begin{table}[h]
+\centering
+\caption{Разделение данных}
+\label{tab:data_split}
+\begin{tabular}{lcp{6cm}}
+\toprule
+\textbf{Набор} & \textbf{Доля} & \textbf{Назначение} \\
+\midrule
+\textbf{Train} & 70\% & Обучение медленных весов $W$ \\
+\textbf{Validation} & 15\% & Подбор гиперпараметров \\
+\textbf{Test} & 15\% & Финальная оценка (не используется для настройки) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Кросс-валидация}
+
+Для оценки статистической значимости результатов рекомендуется k-fold кросс-валидация:
+\begin{itemize}
+    \item $k = 5$ (пять фолдов)
+    \item Для каждого фолда: отдельный запуск обучения с разными seed
+    \item Отчёт: среднее значение $\pm$ стандартное отклонение
+\end{itemize}
+
+\subsection{Критерии успеха}
+
+Архитектура считается успешно валидированной при выполнении следующих условий:
+
+\begin{table}[h]
+\centering
+\caption{Критерии успеха валидации}
+\label{tab:success_criteria}
+\begin{tabular}{lp{5cm}l}
+\toprule
+\textbf{Критерий} & \textbf{Порог} & \textbf{Приоритет} \\
+\midrule
+CER на LJSpeech & $\leq 10\%$ & Высокий \\
+Adaptation Time & $< 100$ шагов & Высокий \\
+Forgetting Rate & $< 5\%$ после 10 циклов сна & Средний \\
+Real-time Factor & $< 1.0$ (быстрее реального времени) & Средний \\
+Численная стабильность & 0 NaN/Inf за 100 часов & Критический \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Примечание:} Пороги являются предварительными и могут быть скорректированы по результатам первых экспериментов.
+
+\section{План отчётности}
+
+Для каждого эксперимента должен быть подготовлен отчёт со следующей структурой:
+
+\begin{enumerate}
+    \item \textbf{Конфигурация:} Версия кода, гиперпараметры, seed, оборудование.
+    \item \textbf{Данные:} Версия датасета, предобработка, аугментация.
+    \item \textbf{Результаты:} Таблицы с метриками (среднее $\pm$ std), графики обучения.
+    \item \textbf{Анализ:} Интерпретация результатов, выявленные аномалии.
+    \item \textbf{Выводы:} Подтверждена ли гипотеза, рекомендации для следующей итерации.
+\end{enumerate}
+
+\textbf{Требование воспроизводимости:} Весь код, конфигурации и предобученные веса должны быть зафиксированы в системе контроля версий с возможностью воспроизведения результатов.
+
+\section{Ограничения экспериментального плана}
+
+Следующие аспекты требуют дополнительного уточнения:
+
+\begin{enumerate}
+    \item \textbf{Вычислительные ресурсы:} Полный набор экспериментов может потребовать значительных GPU-часов. Рекомендуется приоритизация задач.
+    
+    \item \textbf{Доступ к данным:} Некоторые датасеты (например, Common Voice) требуют регистрации и могут иметь ограничения на использование.
+    
+    \item \textbf{Время валидации:} Тесты на долгосрочное забывание (10+ циклов сна) требуют длительных прогонов.
+    
+    \item \textbf{Статистическая мощность:} Для надёжной оценки значимости различий может потребоваться больше чем 5 фолдов.
+\end{enumerate}
+
+Эти ограничения следует учитывать при планировании экспериментальной фазы.
+
+\section{Сводная таблица экспериментов}
+
+\begin{table}[h]
+\centering
+\caption{План экспериментов}
+\label{tab:experiments_summary}
+\begin{tabular}{lp{3cm}p{3cm}lp{2cm}}
+\toprule
+\textbf{Эксперимент} & \textbf{Датасет} & \textbf{Метрики} & \textbf{Базлайны} & \textbf{Приоритет} \\
+\midrule
+E-1: Базовый ASR & LJSpeech & CER, WER, Loss & LSTM, CfC, Mamba & Высокий \\
+E-2: Адаптация & Common Voice & Adaptation Time & Transformer, SSM & Высокий \\
+E-3: Шум & LJSpeech + Noise & CER vs SNR & Все базлайны & Средний \\
+E-4: Абляция & LJSpeech & Все метрики & DREAM-Net full & Средний \\
+E-5: Долгосрочность & Custom & Forgetting Rate & Модели без сна & Низкий \\
+\bottomrule
+\end{tabular}
+\end{table}

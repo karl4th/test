@@ -1,0 +1,297 @@
+\section{Обзор требований к безопасности}
+
+Данная спецификация описывает меры обеспечения численной устойчивости, потокобезопасности и защиты от деградации системы. Учитывая, что DREAM-Net допускает изменение параметров во время инференса, критически важно предотвратить нестабильность, вызванную неограниченным ростом весов, гонками данных между потоками или численными артефактами.
+
+\textbf{Цели раздела:}
+\begin{enumerate}
+    \item Гарантировать ограниченность всех динамических параметров.
+    \item Обеспечить корректную работу в многопоточной среде (инференс + сон).
+    \item Предотвратить каскадные сбои при аномальных входных данных.
+\end{enumerate}
+
+\section{Ограничение весов (Weight Clipping)}
+
+\subsection{Быстрые веса ($U_t$)}
+
+Быстрые веса обновляются на каждом шаге и потенциально могут расти неограниченно при длительном воздействии сигнала с высоким $S_t$. Для предотвращения этого вводится жёсткое ограничение нормы Фробениуса:
+
+\begin{equation}
+U_t^{(l)} \leftarrow U_t^{(l)} \cdot \min\left(1, \, \frac{U_{max}}{\|U_t^{(l)}\|_F + \epsilon}\right)
+\label{eq:weight_clipping}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\|U\|_F = \sqrt{\sum_{i,j} U_{ij}^2}$ — норма Фробениуса
+    \item $U_{max} = 10.0$ (по умолчанию, подбирается экспериментально)
+    \item $\epsilon = 10^{-6}$ — численная стабильность
+\end{itemize}
+
+\textbf{Частота применения:} После каждого обновления $U_t$ (каждый шаг инференса).
+
+\textbf{Обоснование:} Ограничение нормы предотвращает «взрыв» эффективных весов $U_t V^\top$, который мог бы привести к неограниченному росту активаций $h_t$.
+
+\subsection{Контекстный вектор ($c_t$)}
+
+Контекстный вектор также подлежит нормировке для предотвращения накопления ошибок связывания:
+\begin{equation}
+c_t \leftarrow \frac{c_t}{\max(1, \|c_t\|_2 / C_{max})}
+\label{eq:context_clipping}
+\end{equation}
+где $C_{max} = \sqrt{d_{ctx}}$ (норма единичного вектора в пространстве FHRR).
+
+\textbf{Частота применения:} После каждого обновления контекста (раздел~\ref{eq:context_update}).
+
+\subsection{Статистика ошибки ($\mu_t, \sigma_t$)}
+
+Для предотвращения деления на ноль и некорректных оценок вводятся нижние границы:
+\begin{equation}
+\sigma_t \leftarrow \max(\sigma_t, \, \sigma_{min})
+\label{eq:sigma_floor}
+\end{equation}
+где $\sigma_{min} = 10^{-4}$ (по умолчанию).
+
+\textbf{Примечание:} Верхняя граница для $\mu_t$ не требуется, так как она адаптируется к масштабу входного сигнала.
+
+\section{Плавное восстановление после Шока (Ramp-up)}
+
+\subsection{Мотивация}
+
+При выходе из режима \textbf{Shock} обратные связи $W_{down}$ и контекстная модуляция были отключены. Резкое восстановление их влияния может вызвать вторичный всплеск ошибки предсказания, так как контекст за время шока не обновлялся и может быть неактуален.
+
+\subsection{Коэффициент модуляции $\alpha_t$}
+
+Вводится скалярный коэффициент $\alpha_t \in [0, 1]$, который плавно увеличивает влияние топ-даун сигналов:
+\begin{equation}
+\alpha_t = \begin{cases}
+0, & \text{если режим Shock} \\
+\min\left(1.0, \, \alpha_{t-1} + \frac{1}{T_{ramp}}\right), & \text{иначе}
+\end{cases}
+\label{eq:alpha_update}
+\end{equation}
+где $T_{ramp} = 50 \, \text{мс} / \Delta t$ — количество шагов рампы.
+
+\subsection{Применение к обратным связям}
+
+Фактическая матрица обратных связей модифицируется следующим образом:
+\begin{equation}
+W_{down, t}^{(l)} = \alpha_t \cdot W_{down}^{(l)}, \quad \text{для } l > 1
+\label{eq:down_alpha}
+\end{equation}
+
+Аналогично модулируется вклад контекста:
+\begin{equation}
+\text{Modulate}_t(c_t, h_t^{(l)}) = \alpha_t \cdot \text{Modulate}(c_t, h_t^{(l)})
+\label{eq:modulate_alpha}
+\end{equation}
+
+\textbf{Гарантия:} $\alpha_t$ никогда не превышает 1.0 и не опускается ниже 0.0.
+
+\section{Потокобезопасность (Concurrency Model)}
+
+\subsection{Архитектура двойной буферизации}
+
+Как описано в разделе~\ref{sec:memory}, система использует два буфера весов для разделения потоков инференса и сна.
+
+\textbf{Требования к реализации:}
+
+\begin{table}[h]
+\centering
+\caption{Механизмы атомарности по платформам}
+\label{tab:concurrency}
+\begin{tabular}{lp{5cm}p{4cm}}
+\toprule
+\textbf{Платформа} & \textbf{Механизм атомарности} & \textbf{Примечание} \\
+\midrule
+\textbf{Python (GIL)} & Присваивание указателей атомарно & Достаточно простого swap \\
+\textbf{C++} & \texttt{std::atomic<WeightBuffer*>} & Требуется memory\_order\_acquire/release \\
+\textbf{Rust} & \texttt{Arc<Mutex<WeightBuffer>>} & Гарантии безопасности владения \\
+\textbf{CUDA} & Копирование через отдельный stream & Избегать синхронизации с основным потоком \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Инвариант целостности буферов}
+
+Система должна гарантировать, что в любой момент времени:
+\begin{equation}
+\text{buffer\_active} \neq \text{buffer\_shadow}
+\label{eq:buffer_invariant}
+\end{equation}
+
+\textbf{Проверка:} В отладочном режиме рекомендуется добавлять assertion перед свопом:
+
+\begin{lstlisting}[language=Python, caption={Проверка целостности буферов}, label={lst:buffer_check}]
+assert self.buffer_active is not self.buffer_shadow, "Buffer aliasing detected"
+\end{lstlisting}
+
+\subsection{Блокировка во время свопа}
+
+Хотя своп указателей атомарен, необходимо убедиться, что ни один поток не держит ссылку на старый буфер после свопа.
+
+\textbf{Рекомендуемая практика:}
+\begin{itemize}
+    \item Инференс должен запрашивать буфер в начале каждого шага \texttt{step()}.
+    \item Сон должен завершить все записи до вызова \texttt{swap\_buffers()}.
+    \item После свопа старый буфер (теперь shadow) может быть безопасно перезаписан.
+\end{itemize}
+
+\section{Численная устойчивость (Numerical Stability)}
+
+\subsection{Защита от деления на ноль}
+
+Все операции деления должны включать эпсилон-слагаемое:
+\begin{equation}
+\frac{a}{b} \rightarrow \frac{a}{b + \epsilon}, \quad \epsilon = 10^{-6}
+\label{eq:epsilon_div}
+\end{equation}
+
+\textbf{Применяется к:}
+\begin{itemize}
+    \item Нормировке удивления ($\sigma_t$ в знаменателе)
+    \item Нормировке весов ($\|U\|_F$ в знаменателе)
+    \item Вычислению градиентов (если реализуется кастомный backward)
+\end{itemize}
+
+\subsection{Стабильность FFT/IFFT}
+
+Операции Fourier HRR требуют внимания к численной точности:
+
+\begin{table}[h]
+\centering
+\caption{Проблемы и решения для FFT}
+\label{tab:fft_stability}
+\begin{tabular}{lp{8cm}}
+\toprule
+\textbf{Проблема} & \textbf{Решение} \\
+\midrule
+Потеря точности в комплексной области & Использовать \texttt{torch.complex64} минимум \\
+Артефакты на границах & Применять windowing (Hann/Hamming) перед FFT \\
+Накопление ошибок округления & Периодическая renormalization контекста \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Градиентный поток}
+
+Все операции в DREAM-Net должны оставаться дифференцируемыми для обучения во время сна:
+
+\begin{table}[h]
+\centering
+\caption{Дифференцируемость операций}
+\label{tab:gradient_flow}
+\begin{tabular}{lp{3cm}p{6cm}}
+\toprule
+\textbf{Операция} & \textbf{Дифференцируемость} & \textbf{Примечание} \\
+\midrule
+FFT/IFFT & ✅ Да & Поддерживается в PyTorch/JAX \\
+Clipping нормы & ✅ Да & Градиент обнуляется за пределами границы \\
+Indicator function ($\mathbb{I}$) & ⚠️ Нет & Использовать Straight-Through Estimator или мягкую аппроксимацию \\
+Atomic swap & ✅ Н/Д & Не влияет на градиенты (операция указателей) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Рекомендация:} Для индикаторных функций в Surprise Gate использовать мягкую сигмоиду вместо жёсткого порога, чтобы сохранить градиентный поток.
+
+\section{Защита от аномальных входов (Input Sanitization)}
+
+\subsection{Валидация входного сигнала}
+
+Перед обработкой каждый вход $x_t$ должен проходить базовую проверку:
+\begin{equation}
+\text{valid}_t = \mathbb{I}\left(\|x_t\| < X_{max}\right) \land \mathbb{I}\left(\text{isfinite}(x_t)\right)
+\label{eq:input_valid}
+\end{equation}
+где $X_{max} = 10.0 \cdot \mu_{input}$ (адаптивный порог на основе статистики входа).
+
+\textbf{Действия при невалидном входе:}
+\begin{enumerate}
+    \item Заменить $x_t$ на последнее валидное значение (hold-last).
+    \item Зарегистрировать событие в логе аномалий.
+    \item Не обновлять статистику $\mu_t, \sigma_t$ для этого шага.
+\end{enumerate}
+
+\subsection{Детекция NaN/Inf}
+
+На каждом шаге рекомендуется проверять ключевые переменные:
+
+\begin{lstlisting}[language=Python, caption={Проверка численной стабильности}, label={lst:nan_check}]
+def check_numerical_stability(h, U, e, S):
+    assert torch.isfinite(h).all(), "NaN in hidden state"
+    assert torch.isfinite(U).all(), "NaN in fast weights"
+    assert torch.isfinite(e).all(), "NaN in prediction error"
+    assert 0 <= S <= 1, "Surprise out of bounds"
+\end{lstlisting}
+
+\textbf{Примечание:} В продакшн-режиме проверки могут быть отключены для производительности, но должны оставаться в отладочных сборках.
+
+\section{Таймауты и аварийное восстановление}
+
+\subsection{Максимальная длительность Шока}
+
+Для предотвращения ситуации, когда система застревает в режиме \textbf{Shock} бесконечно, вводится максимальная длительность:
+\begin{equation}
+\text{if } (t - t_{shock\_enter}) > T_{shock\_max} \text{ then force exit to Learning}
+\label{eq:shock_timeout}
+\end{equation}
+где $T_{shock\_max} = 500 \, \text{мс}$ (по умолчанию).
+
+\textbf{Обоснование:} Если система не может выйти из шока естественным путём за 500 мс, вероятно, произошла деградация статистики $\mu_t, \sigma_t$. Принудительный выход позволяет сбросить состояние.
+
+\subsection{Сброс статистики при деградации}
+
+При детекции аномалии в статистике (например, $\sigma_t = 0$ или $\sigma_t > 1000 \cdot \sigma_{baseline}$):
+\begin{enumerate}
+    \item Сбросить $\mu_t, \sigma_t$ к инициализационным значениям.
+    \item Сбросить быстрые веса $U_t \leftarrow U_{target}$.
+    \item Зарегистрировать событие критической ошибки.
+\end{enumerate}
+
+\section{Сводная таблица инвариантов}
+
+\begin{table}[h]
+\centering
+\caption{Инварианты безопасности}
+\label{tab:safety_invariants}
+\begin{tabular}{lp{5cm}lp{2.5cm}}
+\toprule
+\textbf{Инвариант} & \textbf{Формула} & \textbf{Частота проверки} & \textbf{Критичность} \\
+\midrule
+Норма быстрых весов & $\|U\|_F \leq U_{max}$ & Каждый шаг & Высокая \\
+Норма контекста & $\|c_t\|_2 \leq C_{max}$ & Каждый шаг & Средняя \\
+Коэффициент рампы & $0 \leq \alpha_t \leq 1$ & Каждый шаг & Высокая \\
+Статистика ошибки & $\sigma_t \geq \sigma_{min}$ & Каждый шаг & Высокая \\
+Целостность буферов & \texttt{active ≠ shadow} & При свопе & Критическая \\
+Конечность значений & \texttt{isfinite(all\_tensors)} & Каждый шаг (debug) & Критическая \\
+Длительность шока & $t_{shock} \leq T_{shock\_max}$ & Каждый шаг & Средняя \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ограничения и открытые вопросы}
+
+Следующие аспекты безопасности требуют дальнейшей проработки:
+
+\begin{enumerate}
+    \item \textbf{Оптимальные значения $U_{max}$:} Слишком жёсткое ограничение может снизить адаптивность, слишком мягкое — допустить нестабильность.
+    
+    \item \textbf{Производительность проверок:} Проверка \texttt{isfinite()} на каждом шаге может добавить заметные накладные расходы на Edge-устройствах.
+    
+    \item \textbf{Восстановление после сброса:} Стратегия восстановления после принудительного сброса статистики не валидирована экспериментально.
+    
+    \item \textbf{Блокировки в многопоточности:} В реальных RTOS-системах могут потребоваться приоритеты потоков для гарантии своевременности свопа буферов.
+\end{enumerate}
+
+Эти вопросы рекомендуется включить в план тестирования на устойчивость (stress testing).
+
+\section{Рекомендации по реализации}
+
+\begin{enumerate}
+    \item \textbf{Вынести все константы безопасности в конфигурационный файл} — это позволит настраивать пороги без перекомпиляции.
+    
+    \item \textbf{Реализовать режим «Safe Mode»} — при включении все проверки активны, производительность снижена, но система максимально устойчива.
+    
+    \item \textbf{Логировать все срабатывания защит} — количество клиппингов весов, сбросов статистики, принудительных выходов из шока. Это поможет отладке.
+    
+    \item \textbf{Документировать все инварианты в коде} — использовать assert с понятными сообщениями об ошибках.
+\end{enumerate}

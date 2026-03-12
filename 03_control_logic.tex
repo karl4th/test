@@ -1,0 +1,267 @@
+\section{Обзор системы управления}
+
+Поведение DREAM-Net определяется конечным автоматом (Finite State Machine, FSM), который переключает три режима работы на основе коэффициента удивления $S_t$. Данная система предназначена для балансировки между стабильностью (удержание знаний) и пластичностью (адаптация к новым данным).
+
+\textbf{Принцип работы:} Пластичность не является постоянной величиной. Она модулируется динамически в зависимости от статистической новизны входного сигнала. Это позволяет минимизировать риск деградации весов на стационарных данных и обеспечить быструю реакцию на изменения распределения.
+
+\section{Состояния автомата (States)}
+
+Система может находиться в одном из трёх взаимоисключающих состояний. Каждое состояние определяет конфигурацию пластичности, контекста и обратных связей.
+
+\begin{table}[h]
+\centering
+\caption{Состояния автомата и их конфигурация}
+\label{tab:states}
+\begin{tabular}{lp{4cm}p{3cm}p{3cm}p{3cm}}
+\toprule
+\textbf{Состояние} & \textbf{Условие активации} & \textbf{Пластичность $U$} & \textbf{Контекст $c_t$} & \textbf{Обратные связи $W_{down}$} \\
+\midrule
+\textbf{Routine} & $S_t < \theta_{low}$ & Заморожена ($\Delta U = 0$) & Обновляется штатно & Активны ($\alpha = 1.0$) \\
+\textbf{Learning} & $\theta_{low} \leq S_t < \theta_{high}$ & Активна ($\Delta U \neq 0$) & Обновляется активно & Активны ($\alpha = 1.0$) \\
+\textbf{Shock} & $S_t \geq \theta_{high}$ (с подтверждением) & Частичная (только слои 1-2) & Заморожен ($c_t = c_{t-1}$) & Отключены ($\alpha \to 0$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Пороговые значения (по умолчанию):}
+\begin{itemize}
+    \item $\theta_{low} \approx \sigma_{sigmoid}((0.7\sigma - \mu_t)/\gamma)$
+    \item $\theta_{high} \approx \sigma_{sigmoid}((2.5\sigma - \mu_t)/\gamma)$
+\end{itemize}
+
+\textbf{Примечание:} Конкретные значения порогов зависят от текущей статистики $\mu_t, \sigma_t$ и могут адаптироваться во времени (см. раздел~\ref{subsec:threshold_adaptation}).
+
+\section{Гистерезис переходов (Hysteresis)}
+\label{sec:hysteresis}
+
+Для предотвращения частых переключений состояний на границах порогов (явление «дребезга») вводится гистерезис. Вход в состояние требует большего отклонения ошибки, чем выход из него.
+
+\subsection{Математическая формулировка гистерезиса}
+
+Пусть $\text{State}_t$ — текущее состояние системы. Переходы определяются следующими правилами:
+
+\textbf{Переход Routine → Learning:}
+\begin{equation}
+\text{State}_{t+1} = \text{Learning}, \quad \text{если } S_t > \theta_{enter}^{learn}
+\label{eq:routine_to_learning}
+\end{equation}
+
+\textbf{Переход Learning → Routine:}
+\begin{equation}
+\text{State}_{t+1} = \text{Routine}, \quad \text{если } S_t < \theta_{exit}^{learn}
+\label{eq:learning_to_routine}
+\end{equation}
+где $\theta_{enter}^{learn} > \theta_{exit}^{learn}$ (гистерезис $\Delta\theta_{learn} \approx 0.4\sigma$).
+
+\textbf{Переход Learning → Shock:}
+\begin{equation}
+\text{State}_{t+1} = \text{Shock}, \quad \text{если } S_t > \theta_{enter}^{shock} \text{ в течение } T_{win}
+\label{eq:learning_to_shock}
+\end{equation}
+
+\textbf{Переход Shock → Learning:}
+\begin{equation}
+\text{State}_{t+1} = \text{Learning}, \quad \text{если } S_t < \theta_{exit}^{shock}
+\label{eq:shock_to_learning}
+\end{equation}
+где $\theta_{enter}^{shock} > \theta_{exit}^{shock}$ (гистерезис $\Delta\theta_{shock} \approx 0.7\sigma$).
+
+\subsection{Таблица порогов по умолчанию}
+
+\begin{table}[h]
+\centering
+\caption{Пороги переходов и гистерезис}
+\label{tab:thresholds}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Переход} & \textbf{Порог входа} & \textbf{Порог выхода} & \textbf{Гистерезис} \\
+\midrule
+Routine $\leftrightarrow$ Learning & $0.7\sigma$ & $0.3\sigma$ & $0.4\sigma$ \\
+Learning $\leftrightarrow$ Shock & $2.5\sigma$ & $1.8\sigma$ & $0.7\sigma$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Обоснование:} Широкий гистерезис для Shock предотвращает ложные срабатывания на кратковременных выбросах, которые могут быть артефактами измерения, а не реальными аномалиями.
+
+\section{Временное окно подтверждения (Confirmation Window)}
+\label{subsec:confirmation_window}
+
+Для входа в режим \textbf{Shock} недостаточно однократного превышения порога. Требуется устойчивое превышение в течение заданного временного интервала.
+
+\subsection{Формула подтверждения}
+
+\begin{equation}
+\text{ShockTrigger}_t = \mathbb{I}\left(\frac{1}{T_{win}} \sum_{k=0}^{T_{win}-1} \mathbb{I}(S_{t-k} > \theta_{enter}^{shock}) \geq \rho_{win}\right)
+\label{eq:shock_confirmation}
+\end{equation}
+где:
+\begin{itemize}
+    \item $T_{win} = 8 \, \text{мс} / \Delta t$ — размер окна в шагах (при $\Delta t = 1 \, \text{мс}$, $T_{win} = 8$)
+    \item $\rho_{win} \in (0, 1]$ — коэффициент заполнения (по умолчанию $\rho_{win} = 0.75$, т.е. 75\% шагов в окне должны превысить порог)
+    \item $\mathbb{I}(\cdot)$ — индикаторная функция
+\end{itemize}
+
+\textbf{Пример:} При частоте дискретизации 1 кГц и окне 8 мс, система требует минимум 6 из 8 последовательных шагов с $S_t > \theta_{enter}^{shock}$ для активации Shock.
+
+\subsection{Обоснование}
+
+Данное требование фильтрует:
+\begin{itemize}
+    \item Одиночные импульсные помехи (щелчки, артефакты АЦП).
+    \item Кратковременные всплески энергии (взрывные согласные в речи).
+    \item Вычислительный шум (numerical noise).
+\end{itemize}
+
+\section{Адаптация порогов (Cap \& Decay)}
+\label{subsec:threshold_adaptation}
+
+Для долгосрочной устойчивости в нестационарных средах пороги $\theta$ могут адаптироваться. Однако, чтобы предотвратить неконтролируемый рост или деградацию чувствительности, вводятся ограничения.
+
+\subsection{Механизм адаптации}
+
+Базовый порог $\tau_{base}$ (используемый в формуле $S_t$) обновляется следующим образом:
+
+\textbf{При нахождении в режиме Shock:}
+\begin{equation}
+\tau_{base, t+1} = \min\left(\tau_{base, t} \cdot (1 + \delta_{up}), \, \tau_{max}\right)
+\label{eq:threshold_up}
+\end{equation}
+
+\textbf{При нахождении в режиме Routine:}
+\begin{equation}
+\tau_{base, t+1} = \max\left(\tau_{base, t} \cdot (1 - \delta_{decay}), \, \tau_{min}\right)
+\label{eq:threshold_decay}
+\end{equation}
+где:
+\begin{itemize}
+    \item $\delta_{up} = 0.10$ (10\% повышение за цикл в Shock)
+    \item $\delta_{decay} = 0.01$ (1\% затухание за цикл в Routine)
+    \item $\tau_{max} = 3.0 \cdot \tau_{base, 0}$ (потолок: не более 3x от базового значения)
+    \item $\tau_{min} = 0.5 \cdot \tau_{base, 0}$ (пол: не менее 50\% от базового значения)
+\end{itemize}
+
+\subsection{Защита от деградации чувствительности}
+
+Механизм \textbf{Decay} гарантирует, что после длительной работы в шумной среде система не «огрубеет» навсегда. При возврате к нормальным условиям пороги медленно возвращаются к базовому значению.
+
+\textbf{Примечание:} Адаптация порогов — это гипотеза, требующая валидации. В первой версии реализации рекомендуется зафиксировать $\tau_{base}$ и отключить адаптацию для упрощения отладки.
+
+\section{Восстановление после Шока (Shock Recovery Ramp)}
+
+Резкое включение обратных связей $W_{down}$ после выхода из режима Shock может вызвать вторичный всплеск ошибки предсказания, так как контекст за время шока не обновлялся и может быть неактуален.
+
+\subsection{Линейная интерполяция коэффициента $\alpha_t$}
+
+При переходе из \textbf{Shock} в \textbf{Learning} вводится коэффициент модуляции обратных связей $\alpha_t$:
+\begin{equation}
+\alpha_t = \min\left(1.0, \, \frac{t - t_{exit}}{T_{ramp}}\right)
+\label{eq:alpha_ramp}
+\end{equation}
+где:
+\begin{itemize}
+    \item $t_{exit}$ — шаг выхода из Shock
+    \item $T_{ramp} = 50 \, \text{мс} / \Delta t$ — длительность рампы (при $\Delta t = 1 \, \text{мс}$, $T_{ramp} = 50$)
+\end{itemize}
+
+\subsection{Модуляция обратных связей}
+
+Фактическая матрица обратных связей применяется с коэффициентом $\alpha_t$:
+\begin{equation}
+W_{down, t}^{(l)} = \alpha_t \cdot W_{down}^{(l)}, \quad \text{для } l > 1
+\label{eq:down_modulation}
+\end{equation}
+
+\textbf{Эффект:} Предсказания сверху постепенно «возвращаются» в систему, давая контексту время синхронизироваться с текущим состоянием нижних слоёв без взрывного роста ошибки.
+
+\section{Псевдокод логики переключения}
+
+\begin{lstlisting}[language=Python, caption={Псевдокод машины состояний}, label={lst:fsm}]
+class DREAMState:
+    Routine = 0
+    Learning = 1
+    Shock = 2
+
+class ControlLogic:
+    def __init__(self):
+        self.state = DREAMState.Routine
+        self.shock_counter = 0
+        self.tau_base = tau_0
+        self.alpha_ramp = 1.0
+
+    def step(self, S_t, sigma_t):
+        # Вычисление адаптивных порогов
+        theta_enter_learn = sigmoid((0.7 * sigma_t - self.tau_base) / gamma)
+        theta_exit_learn = sigmoid((0.3 * sigma_t - self.tau_base) / gamma)
+        theta_enter_shock = sigmoid((2.5 * sigma_t - self.tau_base) / gamma)
+        theta_exit_shock = sigmoid((1.8 * sigma_t - self.tau_base) / gamma)
+
+        # Машина состояний с гистерезисом
+        if self.state == DREAMState.Routine:
+            if S_t > theta_enter_learn:
+                self.state = DREAMState.Learning
+
+        elif self.state == DREAMState.Learning:
+            if S_t < theta_exit_learn:
+                self.state = DREAMState.Routine
+            elif S_t > theta_enter_shock:
+                self.shock_counter += 1
+                if self.shock_counter >= T_win:
+                    self.state = DREAMState.Shock
+                    self.shock_counter = 0
+            else:
+                self.shock_counter = max(0, self.shock_counter - 1)
+
+        elif self.state == DREAMState.Shock:
+            if S_t < theta_exit_shock:
+                self.state = DREAMState.Learning
+                self.alpha_ramp = 0.0  # Начать рампу с нуля
+            # Адаптация порога в шоке
+            self.tau_base = min(self.tau_base * 1.10, tau_max)
+
+        # Затухание порога в спокойном режиме
+        if self.state == DREAMState.Routine:
+            self.tau_base = max(self.tau_base * 0.99, tau_min)
+
+        # Рампа восстановления
+        if self.state != DREAMState.Shock:
+            self.alpha_ramp = min(1.0, self.alpha_ramp + 1.0 / T_ramp)
+
+        return self.state, self.alpha_ramp
+\end{lstlisting}
+
+\section{Инварианты и гарантии}
+
+Для обеспечения корректности реализации рекомендуется проверять следующие инварианты на каждом шаге (в режиме отладки):
+
+\begin{table}[h]
+\centering
+\caption{Инварианты системы управления}
+\label{tab:invariants_control}
+\begin{tabular}{lp{6cm}p{4cm}}
+\toprule
+\textbf{Инвариант} & \textbf{Формула} & \textbf{Назначение} \\
+\midrule
+Ограниченность порогов & $\tau_{min} \leq \tau_{base} \leq \tau_{max}$ & Предотвращение ухода порогов в бесконечность \\
+Ограниченность рампы & $0.0 \leq \alpha_t \leq 1.0$ & Гарантия корректной модуляции \\
+Счётчик шока & $0 \leq \text{shock\_counter} \leq T_{win}$ & Предотвращение переполнения \\
+Норма быстрых весов & $\|U\|_F \leq U_{max}$ & Численная устойчивость (см. раздел~\ref{eq:weight_clip}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Примечание:} В продакшн-режиме проверка инвариантов может быть отключена для производительности, но должна оставаться в отладочных сборках.
+
+\section{Ограничения и открытые вопросы}
+
+Следующие аспекты системы управления требуют дальнейшей экспериментальной проверки:
+
+\begin{enumerate}
+    \item \textbf{Оптимальные значения гистерезиса:} Предложенные значения ($0.4\sigma$, $0.7\sigma$) выбраны эвристически и могут требовать настройки под конкретные задачи.
+    
+    \item \textbf{Скорость адаптации порогов:} Параметры $\delta_{up}$ и $\delta_{decay}$ могут влиять на скорость реакции системы на долгосрочные изменения среды.
+    
+    \item \textbf{Длительность рампы:} $T_{ramp} = 50 \, \text{мс}$ — предварительная оценка. Слишком короткая рампа может не предотвратить вторичный шок, слишком длинная — замедлить восстановление нормальной работы.
+\end{enumerate}
+
+Эти параметры рекомендуется вынести в конфигурационный файл и подвергнуть абляционному тестированию (см. раздел 7 плана валидации).
